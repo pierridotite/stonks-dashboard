@@ -75,3 +75,7 @@ Requests are rate-limited and cached (`cache.json`). Crypto details cache ~30 mi
 ## License
 
 MIT - See [LICENSE](LICENSE)
+
+## Stargazers
+
+[![Star History Chart](https://api.star-history.com/svg?repos=pierridotite/stonks-dashboard&type=Date&theme=dark)](https://star-history.com/#pierridotite/stonks-dashboard&Date)
