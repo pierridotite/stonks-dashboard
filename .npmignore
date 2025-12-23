@@ -1,0 +1,7 @@
+# Exclude runtime cache from npm package
+cache.json
+
+# Ignore local logs and temp
+npm-debug.log*
+*.log
+.tmp/

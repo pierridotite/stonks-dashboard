@@ -1,0 +1,24 @@
+{
+  "_comment": "Example cache. Real cache is created at runtime in cache.json.",
+  "example": {
+    "symbol": "BTC",
+    "type": "crypto",
+    "price": 0,
+    "change": 0,
+    "change24h": 0,
+    "history": [0],
+    "timestamps": [],
+    "open": 0,
+    "high": 0,
+    "low": 0,
+    "high52w": 0,
+    "low52w": 0,
+    "marketCap": 0,
+    "volume": 0,
+    "circulatingSupply": 0,
+    "totalSupply": 0,
+    "rank": 0,
+    "timestamp": 0,
+    "error": false
+  }
+}
