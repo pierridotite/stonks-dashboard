@@ -37,7 +37,7 @@ stonks-dashboard
 ## Local Development
 
 ```bash
-git clone https://github.com/praffall/stonks-dashboard.git
+git clone https://github.com/pierridotite/stonks-dashboard.git
 cd stonks-dashboard
 npm install
 npm start
