@@ -6,8 +6,6 @@
 [![npm version](https://img.shields.io/npm/v/stonks-dashboard.svg)](https://www.npmjs.com/package/stonks-dashboard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-<a href="https://www.producthunt.com/products/stonks-dashboard?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-stonks-dashboard" target="_blank" rel="noopener noreferrer"><img alt="Stonks Dashboard - Real-time crypto &amp; stock dashboard for your terminal | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1053667&amp;theme=light&amp;t=1766564383605"></a>
-
 **Minimal real-time market dashboard for your terminal**
 
 ![Dashboard](assets/dashboard.png)
