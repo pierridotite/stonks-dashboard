@@ -28,6 +28,8 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@aws-sdk/client-bedrock": "^3.1075.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1075.0",
     "axios": "^1.6.2",
     "blessed": "^0.1.81",
     "blessed-contrib": "^4.11.0",
