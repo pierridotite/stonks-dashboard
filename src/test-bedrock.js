@@ -12,10 +12,11 @@ import {
 
 // --- Configuration ---
 const AWS_REGION = process.env.AWS_REGION || "us-east-1";
+// BEDROCK_API_KEY prend la priorité sur AWS_ACCESS_KEY_ID (qui peut valoir "proxy-injected")
 const AWS_ACCESS_KEY_ID =
-  process.env.AWS_ACCESS_KEY_ID || process.env.BEDROCK_API_KEY;
+  process.env.BEDROCK_API_KEY || process.env.AWS_ACCESS_KEY_ID;
 const AWS_SECRET_ACCESS_KEY =
-  process.env.AWS_SECRET_ACCESS_KEY || process.env.BEDROCK_API_SECRET;
+  process.env.BEDROCK_API_SECRET || process.env.AWS_SECRET_ACCESS_KEY;
 
 if (!AWS_ACCESS_KEY_ID || !AWS_SECRET_ACCESS_KEY) {
   console.error(
