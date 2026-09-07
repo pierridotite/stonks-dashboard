@@ -3,33 +3,85 @@ import blessed from 'blessed';
 import contrib from 'blessed-contrib';
 import chalk from 'chalk';
 import { readFileSync } from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
+import { pathToFileURL } from 'url';
 import { DataService } from './dataService.js';
+import { DATA_DIR, initUserConfig, resolveConfigPath, USER_CONFIG_FILE } from './paths.js';
+import {
+  CATEGORY_META,
+  formatChange,
+  formatNumber,
+  formatPrice,
+  getAssetCategory,
+  scrollOffset,
+  sortByCategory
+} from './utils.js';
 
-class StonksDashboard {
-  constructor() {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = path.dirname(__filename);
-    const CONFIG_PATH = path.resolve(__dirname, '../config.json');
-    this.config = JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
+const pkg = createRequire(import.meta.url)('../package.json');
+
+const PERIODS = [
+  { label: '1D', days: 1 },
+  { label: '7D', days: 7 },
+  { label: '30D', days: 30 },
+  { label: '90D', days: 90 }
+];
+
+const USAGE = `stonks-dashboard ${pkg.version} - real-time market dashboard for the terminal
+
+Usage: stonks-dashboard [options]
+
+Options:
+  -c, --config <path>  Use this config file
+      --init           Create ${USER_CONFIG_FILE} from the bundled defaults
+  -h, --help           Show this help
+  -v, --version        Show the version
+
+Config lookup order: --config, ./config.json, ~/.stonks-dashboard/config.json,
+then the config bundled with the package. Cache and logs live in ${DATA_DIR}.
+
+Keys: up/down or k/j navigate, home/end jump, 1-4 change period,
+      r refresh, q or Esc quit.
+`;
+
+export function loadConfig(argv) {
+  const { path: configPath, source } = resolveConfigPath(argv);
+  let config;
+  try {
+    config = JSON.parse(readFileSync(configPath, 'utf-8'));
+  } catch (error) {
+    throw new Error(`Cannot read config ${configPath}: ${error.message}`);
+  }
+  if (!Array.isArray(config.tickers) || config.tickers.length === 0) {
+    throw new Error(`Config ${configPath} must contain a non-empty "tickers" array`);
+  }
+  return {
+    tickers: config.tickers.map((t) => String(t).toUpperCase()),
+    cryptoIds: config.cryptoIds ?? {},
+    updateInterval: Math.max(10000, Number(config.updateInterval) || 120000),
+    configPath,
+    source
+  };
+}
+
+export class StonksDashboard {
+  /**
+   * @param config result of loadConfig()
+   * @param screenOptions extra blessed.screen options (tests pass fake streams)
+   */
+  constructor(config, screenOptions = {}) {
+    this.config = config;
+    this.screenOptions = screenOptions;
     this.dataService = new DataService();
     this.assetsData = [];
-    this.prevAssetsData = [];
-    this.flashIndices = new Set();
     this.selectedIndex = 0;
-    this.isLoading = true;
+    this.selectedSymbol = null;
+    this.listOffset = 0;
+    this.currentPeriodIndex = 1; // 7D
+    this.isFetching = false;
+    this.refreshRequested = false;
+    this.refreshTimer = null;
     this.connectionError = false;
-    
-    // Time periods: 1D, 7D, 30D, 90D
-    this.periods = [
-      { label: '1D', days: 1 },
-      { label: '7D', days: 7 },
-      { label: '30D', days: 30 },
-      { label: '90D', days: 90 }
-    ];
-    this.currentPeriodIndex = 1; // Default 7D
-    
+
     this.initScreen();
     this.initWidgets();
     this.setupKeyHandlers();
@@ -39,22 +91,16 @@ class StonksDashboard {
     this.screen = blessed.screen({
       smartCSR: true,
       title: 'STONKS DASHBOARD',
-      fullUnicode: true
+      fullUnicode: true,
+      ...this.screenOptions
     });
-
-    this.screen.key(['escape', 'q', 'C-c'], () => {
-      return process.exit(0);
-    });
+    this.screen.key(['escape', 'q', 'C-c'], () => this.quit());
+    this.screen.on('resize', () => this.refreshDisplay());
   }
 
   initWidgets() {
-    const grid = new contrib.grid({
-      rows: 12,
-      cols: 12,
-      screen: this.screen
-    });
+    const grid = new contrib.grid({ rows: 12, cols: 12, screen: this.screen });
 
-    // Watchlist table - left column
     this.watchlistTable = grid.set(0, 0, 12, 4, contrib.table, {
       keys: false,
       vi: false,
@@ -64,53 +110,39 @@ class StonksDashboard {
       border: { type: 'line', fg: 'cyan' },
       fg: 'white',
       columnSpacing: 1,
-      columnWidth: [8, 12, 10]
+      columnWidth: [9, 12, 10]
     });
 
-    // Trend chart - top right
     this.trendChart = grid.set(0, 4, 7, 8, contrib.line, {
       label: ' PRICE TREND (7D) ',
       border: { type: 'line', fg: 'cyan' },
-      style: {
-        line: 'green',
-        text: 'white',
-        baseline: 'white',
-        border: { fg: 'cyan' }
-      },
+      style: { line: 'green', text: 'white', baseline: 'white', border: { fg: 'cyan' } },
       showLegend: false,
       xPadding: 3,
       yPadding: 1,
       wholeNumbersOnly: false,
-      minY: null  // Auto-scale, don't start at 0
+      minY: null
     });
 
-    // Details box - bottom right
     this.detailsBox = grid.set(7, 4, 5, 8, blessed.box, {
       label: ' DETAILS ',
       border: { type: 'line', fg: 'cyan' },
-      style: {
-        border: { fg: 'cyan' }
-      },
+      style: { border: { fg: 'cyan' } },
       tags: true,
       content: ' '
     });
 
-    // Status bar at bottom
     this.statusBar = blessed.box({
       bottom: 0,
       left: 0,
       width: '100%',
       height: 1,
-      style: {
-        fg: 'cyan',
-        bg: 'black'
-      },
+      style: { fg: 'cyan', bg: 'black' },
       tags: true,
       content: ' Loading...'
     });
     this.screen.append(this.statusBar);
 
-    // Loading spinner
     this.loadingSpinner = blessed.loading({
       top: 'center',
       left: 'center',
@@ -123,29 +155,27 @@ class StonksDashboard {
   }
 
   setupKeyHandlers() {
-    // Arrow up
-    this.screen.key(['up', 'k'], () => {
-      if (this.assetsData.length === 0) return;
-      if (this.selectedIndex > 0) {
-        this.selectedIndex--;
-        this.refreshDisplay();
-      }
-    });
+    this.screen.key(['up', 'k'], () => this.select(this.selectedIndex - 1));
+    this.screen.key(['down', 'j'], () => this.select(this.selectedIndex + 1));
+    this.screen.key(['home', 'g'], () => this.select(0));
+    this.screen.key(['end', 'S-g'], () => this.select(this.assetsData.length - 1));
+    this.screen.key(['r'], () => this.requestRefresh());
+    PERIODS.forEach((_, i) => this.screen.key([String(i + 1)], () => this.switchPeriod(i)));
+  }
 
-    // Arrow down
-    this.screen.key(['down', 'j'], () => {
-      if (this.assetsData.length === 0) return;
-      if (this.selectedIndex < this.assetsData.length - 1) {
-        this.selectedIndex++;
-        this.refreshDisplay();
-      }
-    });
+  select(index) {
+    if (this.assetsData.length === 0) return;
+    const clamped = Math.max(0, Math.min(index, this.assetsData.length - 1));
+    if (clamped === this.selectedIndex) return;
+    this.selectedIndex = clamped;
+    this.selectedSymbol = this.assetsData[clamped].symbol;
+    this.refreshDisplay();
+  }
 
-    // Period switch keys
-    this.screen.key(['1'], () => this.switchPeriod(0));
-    this.screen.key(['2'], () => this.switchPeriod(1));
-    this.screen.key(['3'], () => this.switchPeriod(2));
-    this.screen.key(['4'], () => this.switchPeriod(3));
+  quit() {
+    if (this.refreshTimer) clearTimeout(this.refreshTimer);
+    this.screen.destroy();
+    process.exit(0);
   }
 
   refreshDisplay() {
@@ -157,257 +187,184 @@ class StonksDashboard {
   }
 
   async switchPeriod(periodIndex) {
-    if (periodIndex < 0 || periodIndex >= this.periods.length) return;
-    if (this.currentPeriodIndex === periodIndex) return;
-    
+    if (periodIndex === this.currentPeriodIndex) return;
     this.currentPeriodIndex = periodIndex;
-    
-    this.loadingSpinner.load('Fetching data...');
+    await this.requestRefresh('Fetching data...');
+  }
+
+  /** Fetch now, or queue a fetch if one is already running. */
+  async requestRefresh(message = 'Refreshing...') {
+    if (this.isFetching) {
+      this.refreshRequested = true;
+      return;
+    }
+    this.loadingSpinner.load(message);
     this.screen.render();
-    
     await this.fetchData();
-    
     this.loadingSpinner.stop();
     this.refreshDisplay();
   }
 
-  formatPrice(price, symbol = '') {
-    if (!price || isNaN(price)) {
-      // Return appropriate zero value based on currency
-      return symbol.endsWith('.L') ? '£0.00' : '$0.00';
-    }
-    
-    // Handle London Stock Exchange stocks (ending in .L)
-    // Yahoo Finance returns LSE prices in pence, so we need to convert
-    if (symbol.endsWith('.L')) {
-      if (price >= 100) {
-        // Show as pounds: £1.23 (convert pence to pounds)
-        const pounds = price / 100;
-        return `£${pounds.toFixed(2)}`;
-      } else {
-        // Show as pence with decimal places: 2.05p
-        return `${price.toFixed(2)}p`;
+  // Rows of the watchlist: section headers plus one row per asset. Each entry
+  // remembers which asset index it maps to (null for headers).
+  buildWatchlistRows() {
+    const rows = [];
+    let currentCategory = null;
+    this.assetsData.forEach((asset, index) => {
+      const category = getAssetCategory(asset);
+      if (category !== currentCategory) {
+        currentCategory = category;
+        rows.push({ cells: [chalk.cyan(CATEGORY_META[category].section), '', ''], assetIndex: null });
       }
-    }
-    
-    // Default USD formatting for other stocks/crypto
-    if (price >= 1000) {
-      return `$${price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-    } else if (price >= 1) {
-      return `$${price.toFixed(2)}`;
-    } else {
-      return `$${price.toFixed(4)}`;
-    }
-  }
-
-  formatChange(change) {
-    if (!change || isNaN(change)) return '+0.00%';
-    const sign = change >= 0 ? '+' : '';
-    return `${sign}${change.toFixed(2)}%`;
-  }
-
-  getAssetCategory(asset) {
-    if (asset.type === 'crypto') return 'crypto';
-    if (asset.type === 'ETF' || asset.type === 'etf') return 'etf';
-    if (asset.type === 'EQUITY' || asset.type === 'equity') return 'stock'
-    return 'stock';
+      const isSelected = index === this.selectedIndex;
+      const symbol = `${isSelected ? '>' : ' '}${asset.symbol}`;
+      const price = formatPrice(asset.price, asset.currency);
+      const change = formatChange(asset.change);
+      const up = asset.change >= 0;
+      const cells = isSelected
+        ? [
+            chalk.bgBlue.white(symbol.padEnd(8)),
+            chalk.bgBlue.white(price.padEnd(11)),
+            up ? chalk.bgBlue.green(change) : chalk.bgBlue.red(change)
+          ]
+        : [chalk.white(symbol), chalk.white(price), up ? chalk.green(change) : chalk.red(change)];
+      rows.push({ cells, assetIndex: index });
+    });
+    return rows;
   }
 
   updateWatchlistTable() {
     if (this.assetsData.length === 0) return;
 
-    const headers = ['SYMBOL', 'PRICE', 'CHANGE'];
-    const rows = [];
-    
-    // Separate by type
-    const cryptos = this.assetsData.filter(a => this.getAssetCategory(a) === 'crypto');
-    const stocks = this.assetsData.filter(a => this.getAssetCategory(a) === 'stock');
-    const etfs = this.assetsData.filter(a => this.getAssetCategory(a) === 'etf');
-    
-    const addSection = (title, assets) => {
-      if (assets.length === 0) return;
-      rows.push([chalk.cyan(title), '', '']);
-      
-      for (const asset of assets) {
-        const isSelected = this.assetsData.indexOf(asset) === this.selectedIndex;
-        const prefix = isSelected ? '>' : ' ';
-        const symbol = `${prefix}${asset.symbol}`;
-        const price = this.formatPrice(asset.price, asset.symbol);
-        const change = this.formatChange(asset.change);
-        
-        if (isSelected) {
-          rows.push([
-            chalk.bgBlue.white(symbol.padEnd(7)),
-            chalk.bgBlue.white(price.padEnd(11)),
-            asset.change >= 0 ? chalk.bgBlue.green(change) : chalk.bgBlue.red(change)
-          ]);
-        } else {
-          rows.push([
-            chalk.white(symbol),
-            chalk.white(price),
-            asset.change >= 0 ? chalk.green(change) : chalk.red(change)
-          ]);
-        }
-      }
-    };
-    
-    addSection('-- CRYPTO --', cryptos);
-    addSection('-- STOCKS --', stocks);
-    addSection('-- ETFs --', etfs);
+    const rows = this.buildWatchlistRows();
+    const selectedRow = rows.findIndex((r) => r.assetIndex === this.selectedIndex);
 
-    this.watchlistTable.setData({ headers, data: rows });
+    // Borders take 2 lines, the column header 2 more. Keep the selection visible
+    // by scrolling the rows ourselves: contrib.table cannot scroll when it is
+    // not interactive, and the list is longer than the screen with many tickers.
+    const visible = Math.max(3, (this.watchlistTable.height || this.screen.height) - 4);
+    this.listOffset = scrollOffset(selectedRow, this.listOffset, visible, rows.length);
+
+    // Markers replace the first/last visible slot, so they hide one more row
+    // each. Cells are truncated to columnWidth by the table: keep them short.
+    const slice = rows.slice(this.listOffset, this.listOffset + visible).map((r) => r.cells);
+    if (this.listOffset > 0) {
+      slice[0] = [chalk.gray(`^ ${this.listOffset + 1} more`), '', ''];
+    }
+    const hiddenBelow = rows.length - (this.listOffset + visible);
+    if (hiddenBelow > 0) {
+      slice[slice.length - 1] = [chalk.gray(`v ${hiddenBelow + 1} more`), '', ''];
+    }
+
+    this.watchlistTable.setData({ headers: ['SYMBOL', 'PRICE', 'CHANGE'], data: slice });
   }
 
   updateChartPanel() {
-    if (this.assetsData.length === 0 || this.selectedIndex < 0) return;
-    if (this.selectedIndex >= this.assetsData.length) {
-      this.selectedIndex = this.assetsData.length - 1;
-    }
-
     const asset = this.assetsData[this.selectedIndex];
     if (!asset) return;
-    
-    // Filter out null/undefined values for history
-    const rawHistory = asset.history || [];
-    const history = rawHistory.filter(v => v !== null && v !== undefined && !isNaN(v));
 
-    // Use timestamps if available and aligned
+    const rawHistory = asset.history || [];
+    const history = rawHistory.filter((v) => Number.isFinite(v));
+    if (history.length === 0) history.push(0);
+
     const rawTs = asset.timestamps || [];
     const hasTimestamps = Array.isArray(rawTs) && rawTs.length === rawHistory.length;
 
-    if (history.length === 0) {
-      history.push(0);
-    }
-    
-    const period = this.periods[this.currentPeriodIndex];
+    const period = PERIODS[this.currentPeriodIndex];
     const len = history.length;
-
-    // Generate clean X-axis labels (prefer timestamps)
     const numLabels = Math.min(10, len);
     const step = Math.max(1, Math.floor(len / numLabels));
 
     const x = [];
     for (let i = 0; i < len; i++) {
-      const isTick = (i === 0 || i === len - 1 || i % step === 0);
-      if (!isTick) { x.push(' '); continue; }
-
+      const isTick = i === 0 || i === len - 1 || i % step === 0;
+      if (!isTick) {
+        x.push(' ');
+        continue;
+      }
       if (hasTimestamps) {
-        const ts = rawTs[i];
-        const d = new Date(ts);
-        if (period.days === 1) {
-          const hh = String(d.getHours()).padStart(2, '0');
-          const mm = String(d.getMinutes()).padStart(2, '0');
-          x.push(`${hh}:${mm}`);
-        } else if (period.days <= 7) {
-          const m = String(d.getMonth() + 1).padStart(2, '0');
-          const day = String(d.getDate()).padStart(2, '0');
-          x.push(`${m}/${day}`);
-        } else {
-          const m = String(d.getMonth() + 1).padStart(2, '0');
-          x.push(`${m}`);
-        }
+        const d = new Date(rawTs[i]);
+        const pad = (n) => String(n).padStart(2, '0');
+        if (period.days === 1) x.push(`${pad(d.getHours())}:${pad(d.getMinutes())}`);
+        else if (period.days <= 7) x.push(`${pad(d.getMonth() + 1)}/${pad(d.getDate())}`);
+        else x.push(pad(d.getMonth() + 1));
       } else {
-        // Fallback: index-based labels
         x.push(period.days === 1 ? `${i}h` : `${i + 1}`);
       }
     }
 
-    const lineColor = asset.change >= 0 ? 'green' : 'red';
-    const category = this.getAssetCategory(asset);
-    const typeLabel = category === 'crypto' ? 'CRYPTO' : (category === 'etf' ? 'ETF' : 'STOCK');
-    
-    this.trendChart.setLabel(` ${asset.symbol} | ${typeLabel} | ${period.label} `);
-    
-    // Calculate min/max for proper Y scaling (add 5% padding)
+    const category = getAssetCategory(asset);
+    this.trendChart.setLabel(` ${asset.symbol} | ${CATEGORY_META[category].label} | ${period.label} `);
+
+    // Auto-scale the Y axis with 5% padding so small moves stay readable.
     const minVal = Math.min(...history);
     const maxVal = Math.max(...history);
     const padding = (maxVal - minVal) * 0.05 || 1;
-
     this.trendChart.options.minY = minVal - padding;
     this.trendChart.options.maxY = maxVal + padding;
 
-    this.trendChart.setData([{
-      title: asset.symbol,
-      x: x,
-      y: history,
-      style: { line: lineColor }
-    }]);
-  }
-
-  formatNumber(num) {
-    if (!num || isNaN(num)) return 'N/A';
-    if (num >= 1e12) return `${(num / 1e12).toFixed(2)}T`;
-    if (num >= 1e9) return `${(num / 1e9).toFixed(2)}B`;
-    if (num >= 1e6) return `${(num / 1e6).toFixed(2)}M`;
-    if (num >= 1e3) return `${(num / 1e3).toFixed(2)}K`;
-    return num.toLocaleString();
+    this.trendChart.setData([
+      { title: asset.symbol, x, y: history, style: { line: asset.change >= 0 ? 'green' : 'red' } }
+    ]);
   }
 
   updateDetailsPanel() {
-    if (this.assetsData.length === 0 || this.selectedIndex < 0) return;
-    if (this.selectedIndex >= this.assetsData.length) return;
-
     const asset = this.assetsData[this.selectedIndex];
     if (!asset) return;
-    
-    const changeColor = asset.change >= 0 ? 'green' : 'red';
-    const changeText = this.formatChange(asset.change);
-    
-    // Determine asset type label
-    const category = this.getAssetCategory(asset);
-    let typeLabel = 'STOCK';
-    let typeIcon = '[S]';
-    if (category === 'crypto') {
-      typeLabel = 'CRYPTO';
-      typeIcon = '[C]';
-    } else if (category === 'etf') {
-      typeLabel = 'ETF';
-      typeIcon = '[E]';
-    }
 
-    let content = '';
-    
-    if (asset.type === 'crypto') {
-      // Crypto detailed view
+    const category = getAssetCategory(asset);
+    const { icon, label } = CATEGORY_META[category];
+    const period = PERIODS[this.currentPeriodIndex].label;
+    const color = (value) => (value >= 0 ? 'green' : 'red');
+    const price = (value) => formatPrice(value, asset.currency);
+    const pct = (value) => `{${color(value)}-fg}${formatChange(value)}{/${color(value)}-fg}`;
+    const rule = ` ${'─'.repeat(38)}`;
+    const source = asset.fromCache ? '{yellow-fg}[CACHE]{/yellow-fg}' : '{green-fg}[LIVE]{/green-fg}';
+    const errorTag = asset.error ? ' {red-fg}[ERROR]{/red-fg}' : '';
+    const title = ` {bold}{cyan-fg}${icon} ${asset.symbol}{/cyan-fg}{/bold} {gray-fg}${label}{/gray-fg}`;
+    const periodRow = ` {bold}${period.padEnd(12)}{/bold} ${pct(asset.change)}`;
+
+    let content;
+    if (category === 'crypto') {
       content = `
- {bold}{cyan-fg}${typeIcon} ${asset.symbol}{/cyan-fg}{/bold} {gray-fg}${typeLabel}{/gray-fg} ${asset.rank ? `#${asset.rank}` : ''}
- ${'─'.repeat(38)}
- {bold}Price{/bold}        ${this.formatPrice(asset.price, asset.symbol)}
- {bold}24h{/bold}          {${changeColor}-fg}${this.formatChange(asset.change24h || asset.change)}{/${changeColor}-fg}
- {bold}Open{/bold}         ${this.formatPrice(asset.open, asset.symbol)}
- ${'─'.repeat(38)}
- {bold}High 24h{/bold}     ${this.formatPrice(asset.high, asset.symbol)}
- {bold}Low 24h{/bold}      ${this.formatPrice(asset.low, asset.symbol)}
- {bold}ATH{/bold}          ${this.formatPrice(asset.high52w, asset.symbol)}
- {bold}ATL{/bold}          ${this.formatPrice(asset.low52w, asset.symbol)}
- ${'─'.repeat(38)}
- {bold}Mkt Cap{/bold}      ${this.formatNumber(asset.marketCap)}
- {bold}Volume 24h{/bold}   ${this.formatNumber(asset.volume)}
- {bold}Circ Supply{/bold}  ${this.formatNumber(asset.circulatingSupply)}
- ${'─'.repeat(38)}
- ${asset.fromCache ? '{yellow-fg}[CACHE]{/yellow-fg}' : '{green-fg}[LIVE]{/green-fg}'} ${asset.error ? '{red-fg}[ERROR]{/red-fg}' : ''}
+${title} ${asset.rank ? `#${asset.rank}` : ''} {gray-fg}${asset.name || ''}{/gray-fg}
+${rule}
+ {bold}Price{/bold}        ${price(asset.price)}
+${periodRow}
+ {bold}24h{/bold}          ${pct(asset.change24h)}
+ {bold}Open{/bold}         ${price(asset.open)}
+${rule}
+ {bold}High 24h{/bold}     ${price(asset.high)}
+ {bold}Low 24h{/bold}      ${price(asset.low)}
+ {bold}ATH{/bold}          ${price(asset.high52w)}
+ {bold}ATL{/bold}          ${price(asset.low52w)}
+${rule}
+ {bold}Mkt Cap{/bold}      ${formatNumber(asset.marketCap)}
+ {bold}Volume 24h{/bold}   ${formatNumber(asset.volume)}
+ {bold}Circ Supply{/bold}  ${formatNumber(asset.circulatingSupply)}
+${rule}
+ ${source}${errorTag}
 `;
     } else {
-      // Stock/ETF detailed view
       content = `
- {bold}{cyan-fg}${typeIcon} ${asset.symbol}{/cyan-fg}{/bold} {gray-fg}${typeLabel}{/gray-fg}
- ${'─'.repeat(38)}
- {bold}Price{/bold}        ${this.formatPrice(asset.price, asset.symbol)}
- {bold}Change{/bold}       {${changeColor}-fg}${changeText}{/${changeColor}-fg}
- {bold}Open{/bold}         ${this.formatPrice(asset.open, asset.symbol)}
- {bold}Prev Close{/bold}   ${this.formatPrice(asset.previousClose, asset.symbol)}
- ${'─'.repeat(38)}
- {bold}High{/bold}         ${this.formatPrice(asset.high, asset.symbol)}
- {bold}Low{/bold}          ${this.formatPrice(asset.low, asset.symbol)}
- {bold}52wk High{/bold}    ${this.formatPrice(asset.high52w, asset.symbol)}
- {bold}52wk Low{/bold}     ${this.formatPrice(asset.low52w, asset.symbol)}
- ${'─'.repeat(38)}
- {bold}Volume{/bold}       ${this.formatNumber(asset.volume)}
- {bold}Avg Vol{/bold}      ${this.formatNumber(asset.avgVolume)}
- {bold}Mkt Cap{/bold}      ${this.formatNumber(asset.marketCap)}
- {bold}P/E{/bold}          ${asset.pe ? asset.pe.toFixed(2) : 'N/A'}
- ${'─'.repeat(38)}
- ${asset.fromCache ? '{yellow-fg}[CACHE]{/yellow-fg}' : '{green-fg}[LIVE]{/green-fg}'} ${asset.error ? '{red-fg}[ERROR]{/red-fg}' : ''}
+${title} {gray-fg}${asset.name || ''}{/gray-fg}
+${rule}
+ {bold}Price{/bold}        ${price(asset.price)}
+${periodRow}
+ {bold}Day{/bold}          ${pct(asset.change24h)}
+ {bold}Open{/bold}         ${price(asset.open)}
+ {bold}Prev Close{/bold}   ${price(asset.previousClose)}
+${rule}
+ {bold}High{/bold}         ${price(asset.high)}
+ {bold}Low{/bold}          ${price(asset.low)}
+ {bold}52wk High{/bold}    ${price(asset.high52w)}
+ {bold}52wk Low{/bold}     ${price(asset.low52w)}
+${rule}
+ {bold}Volume{/bold}       ${formatNumber(asset.volume)}
+ {bold}Exchange{/bold}     ${asset.exchange || 'N/A'}
+ {bold}Currency{/bold}     ${asset.currency || 'USD'}
+${rule}
+ ${source}${errorTag}
 `;
     }
 
@@ -416,80 +373,92 @@ class StonksDashboard {
 
   updateStatusBar() {
     const now = new Date().toLocaleTimeString();
-    const period = this.periods[this.currentPeriodIndex].label;
-    const assetCount = this.assetsData.length;
-    const selected = this.selectedIndex + 1;
-    
-    const status = this.connectionError 
-      ? '{yellow-fg}CACHED{/yellow-fg}' 
-      : '{green-fg}LIVE{/green-fg}';
-    
+    const period = PERIODS[this.currentPeriodIndex].label;
+    const status = this.connectionError ? '{yellow-fg}CACHED{/yellow-fg}' : '{green-fg}LIVE{/green-fg}';
+    const position = `${this.selectedIndex + 1}/${this.assetsData.length}`;
     this.statusBar.setContent(
-      ` ${status} | ${selected}/${assetCount} | ${period} | ${now} | {cyan-fg}[1-4]{/cyan-fg} Period | {cyan-fg}[UP/DOWN]{/cyan-fg} Navigate | {cyan-fg}[q]{/cyan-fg} Quit`
+      ` ${status} | ${position} | ${period} | ${now} | {cyan-fg}[1-4]{/cyan-fg} Period | {cyan-fg}[UP/DOWN]{/cyan-fg} Navigate | {cyan-fg}[r]{/cyan-fg} Refresh | {cyan-fg}[q]{/cyan-fg} Quit`
     );
   }
 
   async fetchData() {
+    this.isFetching = true;
     try {
-      this.connectionError = false;
-      const period = this.periods[this.currentPeriodIndex];
-      const newData = await this.dataService.fetchAllAssets(
-        this.config.tickers,
-        this.config.cryptoIds,
-        period.days
-      );
-      
-      // Compute flash indices
-      const prevBySymbol = new Map(this.prevAssetsData.map(a => [a.symbol, a]));
-      this.flashIndices.clear();
-      for (const asset of newData) {
-        const prev = prevBySymbol.get(asset.symbol);
-        if (prev && prev.price > 0) {
-          const deltaPct = Math.abs((asset.price - prev.price) / prev.price) * 100;
-          if (deltaPct >= 2) {
-            this.flashIndices.add(asset.symbol);
-          }
-        }
-      }
-      
-      this.prevAssetsData = this.assetsData;
-      this.assetsData = newData;
-      
-      // Clamp selected index
-      if (this.selectedIndex >= this.assetsData.length) {
-        this.selectedIndex = Math.max(0, this.assetsData.length - 1);
-      }
-      
-      this.connectionError = this.assetsData.some(asset => asset.error);
-      
-    } catch (error) {
+      const period = PERIODS[this.currentPeriodIndex];
+      const fresh = await this.dataService.fetchAllAssets(this.config.tickers, this.config.cryptoIds, period.days);
+
+      // Draw order = navigation order (see issue #4): group by category once,
+      // then keep the selection on the same symbol across refreshes.
+      this.assetsData = sortByCategory(fresh.filter(Boolean));
+      const keep = this.assetsData.findIndex((a) => a.symbol === this.selectedSymbol);
+      this.selectedIndex = keep >= 0 ? keep : Math.max(0, Math.min(this.selectedIndex, this.assetsData.length - 1));
+      this.selectedSymbol = this.assetsData[this.selectedIndex]?.symbol ?? null;
+
+      this.connectionError = this.assetsData.some((asset) => asset.error);
+    } catch {
       this.connectionError = true;
+    } finally {
+      this.isFetching = false;
+    }
+
+    if (this.refreshRequested) {
+      this.refreshRequested = false;
+      await this.fetchData();
     }
   }
 
-  async startGameLoop() {
-    await this.fetchData();
-    
-    this.isLoading = false;
-    this.loadingSpinner.stop();
-    this.refreshDisplay();
-
-    // Update loop
-    setInterval(async () => {
-      await this.fetchData();
-      this.refreshDisplay();
+  scheduleNextRefresh() {
+    this.refreshTimer = setTimeout(async () => {
+      if (!this.isFetching) {
+        await this.fetchData();
+        this.refreshDisplay();
+      }
+      this.scheduleNextRefresh();
     }, this.config.updateInterval);
   }
 
   async start() {
     this.loadingSpinner.load('Loading market data...');
     this.screen.render();
-    await this.startGameLoop();
+    await this.fetchData();
+    this.loadingSpinner.stop();
+    this.refreshDisplay();
+    this.scheduleNextRefresh();
   }
 }
 
-const dashboard = new StonksDashboard();
-dashboard.start().catch(error => {
-  console.error('Fatal error:', error);
-  process.exit(1);
-});
+function main() {
+  const argv = process.argv.slice(2);
+  if (argv.includes('-h') || argv.includes('--help')) {
+    process.stdout.write(USAGE);
+    return;
+  }
+  if (argv.includes('-v') || argv.includes('--version')) {
+    process.stdout.write(`${pkg.version}\n`);
+    return;
+  }
+  if (argv.includes('--init')) {
+    const { path, created } = initUserConfig();
+    process.stdout.write(created ? `Created ${path}\n` : `${path} already exists, left untouched\n`);
+    return;
+  }
+
+  const config = loadConfig(argv);
+  const dashboard = new StonksDashboard(config);
+  dashboard.start().catch((error) => {
+    dashboard.screen.destroy();
+    console.error('Fatal error:', error);
+    process.exit(1);
+  });
+}
+
+// Only start the UI when run as a script, so the class can be imported by tests.
+const isEntryPoint = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isEntryPoint) {
+  try {
+    main();
+  } catch (error) {
+    console.error(error.message);
+    process.exit(1);
+  }
+}

@@ -1,9 +1,33 @@
 {
   "name": "stonks-dashboard",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "A cyberpunk-style real-time financial monitor for the terminal",
-  "main": "src/index.js",
+  "keywords": [
+    "stocks",
+    "crypto",
+    "etf",
+    "terminal",
+    "dashboard",
+    "tui",
+    "finance",
+    "yahoo-finance",
+    "coingecko"
+  ],
+  "author": "Pierre Raffalli <praffalli1@gmail.com> (https://github.com/pierridotite)",
+  "license": "MIT",
+  "homepage": "https://github.com/pierridotite/stonks-dashboard#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pierridotite/stonks-dashboard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pierridotite/stonks-dashboard/issues"
+  },
   "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "stonks-dashboard": "./src/index.js"
+  },
   "files": [
     "src",
     "README.md",
@@ -11,26 +35,22 @@
     "config.json",
     "assets"
   ],
-  "bin": {
-    "stonks-dashboard": "./src/index.js"
+  "engines": {
+    "node": ">=18"
   },
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node src/index.js"
+    "test": "node --test",
+    "prepublishOnly": "npm test"
   },
-  "keywords": [
-    "stocks",
-    "crypto",
-    "terminal",
-    "dashboard",
-    "TUI"
-  ],
-  "author": "",
-  "license": "MIT",
   "dependencies": {
     "axios": "^1.6.2",
     "blessed": "^0.1.81",
     "blessed-contrib": "^4.11.0",
     "chalk": "^5.3.0"
+  },
+  "overrides": {
+    "lodash": "^4.18.1",
+    "xml2js": "^0.6.2"
   }
 }
